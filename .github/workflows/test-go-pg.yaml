@@ -24,7 +24,8 @@ jobs:
     # Leave at least 5 minutes after the Go timeout fires, counting the
     # slowest setup steps, for the dump and the artifact uploads. The
     # macOS lane shortens its Go timeout below because its setup is slow.
-    timeout-minutes: 45
+    # Allow both passes to reach Go's timeout and upload diagnostics.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -141,7 +142,7 @@ jobs:
           # Default is 511; 999 is the maximum value on CI runner.
           sudo sysctl -w kern.tty.ptmx_max=999
 
-      - name: Test with PostgreSQL Database (Linux)
+      - name: Test with PostgreSQL Database (Linux, pass 1)
         if: runner.os == 'Linux'
         uses: ./.github/actions/test-go-pg
         with:
@@ -149,9 +150,19 @@ jobs:
           # Match the upstream 8-vCPU runner with 8x8 test concurrency.
           test-parallelism-packages: "8"
           test-parallelism-tests: "8"
-          # By default, run tests with cache for improved speed (possibly at the expense of correctness).
-          # On main, run tests without cache for the inverse.
-          test-count: ${{ github.ref == 'refs/heads/main' && '1' || '' }}
+          # Execute every test while allowing compiled artifacts to be cached.
+          test-count: "1"
+          gotestsum-json-file: default
+
+      - name: Test with PostgreSQL Database (Linux, pass 2)
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/test-go-pg
+        with:
+          postgres-version: "13"
+          test-parallelism-packages: "8"
+          test-parallelism-tests: "8"
+          # Reuse the first pass's caches on the same runner, but rerun every test.
+          test-count: "1"
           gotestsum-json-file: default
 
       - name: Test with PostgreSQL Database (macOS)
