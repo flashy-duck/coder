@@ -67,7 +67,7 @@ jobs:
       - name: Set up mise tools
         uses: ./.github/actions/setup-mise
         with:
-          install-args: "go terraform"
+          install-args: "go terraform helm"
 
       - name: Install Go mise tools
         shell: bash
