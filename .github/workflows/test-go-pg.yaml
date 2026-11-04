@@ -146,7 +146,7 @@ jobs:
         uses: ./.github/actions/test-go-pg
         with:
           postgres-version: "13"
-          # Keep upstream 8x8 test concurrency on the 16-vCPU large preset.
+          # Match the upstream 8-vCPU runner with 8x8 test concurrency.
           test-parallelism-packages: "8"
           test-parallelism-tests: "8"
           # By default, run tests with cache for improved speed (possibly at the expense of correctness).
