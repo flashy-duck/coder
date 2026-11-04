@@ -1,0 +1,235 @@
+# Linux test-go-pg lane from ci.yaml, using the same local composite action.
+name: test-go-pg
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [test-go-pg]
+
+permissions: {}
+
+concurrency:
+  group: test-go-pg-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-go-pg:
+    # make sure to adjust NUM_PARALLEL_PACKAGES and NUM_PARALLEL_TESTS below
+    # when changing runner sizes
+    runs-on: [coder-large]
+    permissions:
+      contents: read
+    # This timeout must be greater than the timeout set by `go test` in
+    # `make test` to ensure we receive a trace of running goroutines.
+    # Leave at least 5 minutes after the Go timeout fires, counting the
+    # slowest setup steps, for the dump and the artifact uploads. The
+    # macOS lane shortens its Go timeout below because its setup is slow.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+    steps:
+      # macOS indexes all new files in the background. Our Postgres tests
+      # create and destroy thousands of databases on disk, and Spotlight
+      # tries to index all of them, seriously slowing down the tests.
+      - name: Disable Spotlight Indexing
+        if: runner.os == 'macOS'
+        run: |
+          enabled=$(sudo mdutil -a -s | { grep -Fc "Indexing enabled" || true; })
+          if [ "$enabled" -eq 0 ]; then
+            echo "Spotlight indexing is already disabled"
+            exit 0
+          fi
+          sudo mdutil -a -i off
+          sudo mdutil -X /
+          sudo launchctl bootout system /System/Library/LaunchDaemons/com.apple.metadata.mds.plist
+
+      # Set up RAM disks to speed up the rest of the job. This action is in
+      # a separate repository to allow its use before actions/checkout.
+      - name: Setup RAM Disks
+        if: runner.os == 'Windows'
+        uses: coder/setup-ramdisk-action@e1100847ab2d7bcd9d14bcda8f2d1b0f07b36f1b # v0.1.0
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Go Paths
+        uses: ./.github/actions/setup-go-paths
+
+      - name: Setup GNU tools (macOS)
+        uses: ./.github/actions/setup-gnu-tools
+
+      - name: Set up mise tools
+        uses: ./.github/actions/setup-mise
+        with:
+          install-args: "go terraform"
+
+      - name: Install Go mise tools
+        shell: bash
+        run: ./.github/scripts/retry.sh -- mise install --locked go:gotest.tools/gotestsum go:github.com/slsyy/mtimehash/cmd/mtimehash
+
+      - name: Download Test Cache
+        id: download-cache
+        uses: ./.github/actions/test-cache/download
+        with:
+          key-prefix: test-go-pg-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Setup Embedded Postgres Cache Paths
+        id: embedded-pg-cache
+        uses: ./.github/actions/setup-embedded-pg-cache-paths
+
+      - name: Download Embedded Postgres Cache
+        id: download-embedded-pg-cache
+        uses: ./.github/actions/embedded-pg-cache/download
+        with:
+          key-prefix: embedded-pg-${{ runner.os }}-${{ runner.arch }}
+          cache-path: ${{ steps.embedded-pg-cache.outputs.cached-dirs }}
+
+      - name: Normalize File and Directory Timestamps
+        shell: bash
+        # Normalize file modification timestamps so that go test can use the
+        # cache from the previous CI run. See https://github.com/golang/go/issues/58571
+        # for more details.
+        #
+        # mtimehash only optimizes cache hits, so a missing binary must not
+        # fail the job before any tests run (coder/internal#1630).
+        run: |
+          if command -v mtimehash >/dev/null 2>&1; then
+            find . -type f ! -path ./.git/\*\* | mtimehash
+          else
+            echo "::warning::mtimehash not found; skipping file timestamp normalization (Go test cache may be cold)"
+          fi
+          find . -type d ! -path ./.git/\*\* -exec touch -t 200601010000 {} +
+
+      - name: Normalize Terraform Path for Caching
+        shell: bash
+        # Terraform gets installed in a random directory, so we need to normalize
+        # the path or many cached tests will be invalidated.
+        run: |
+          mkdir -p "$RUNNER_TEMP/sym"
+          source scripts/normalize_path.sh
+          normalize_path_with_symlinks "$RUNNER_TEMP/sym" "$(dirname "$(which terraform)")"
+
+      - name: Setup RAM disk for Embedded Postgres (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        # The default C: drive is extremely slow:
+        # https://github.com/actions/runner-images/issues/8755
+        run: mkdir -p "R:/temp/embedded-pg"
+
+      - name: Setup RAM disk for Embedded Postgres (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # Postgres runs faster on a ramdisk on macOS.
+          mkdir -p /tmp/tmpfs
+          sudo mount_tmpfs -o noowners -s 8g /tmp/tmpfs
+
+          # macOS will output "The default interactive shell is now zsh" intermittently in CI.
+          touch ~/.bash_profile && echo "export BASH_SILENCE_DEPRECATION_WARNING=1" >> ~/.bash_profile
+
+      - name: Increase PTY limit (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # Increase PTY limit to avoid exhaustion during tests.
+          # Default is 511; 999 is the maximum value on CI runner.
+          sudo sysctl -w kern.tty.ptmx_max=999
+
+      - name: Test with PostgreSQL Database (Linux)
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/test-go-pg
+        with:
+          postgres-version: "13"
+          # Keep upstream 8x8 test concurrency on the 16-vCPU large preset.
+          test-parallelism-packages: "8"
+          test-parallelism-tests: "8"
+          # By default, run tests with cache for improved speed (possibly at the expense of correctness).
+          # On main, run tests without cache for the inverse.
+          test-count: ${{ github.ref == 'refs/heads/main' && '1' || '' }}
+          gotestsum-json-file: default
+
+      - name: Test with PostgreSQL Database (macOS)
+        if: runner.os == 'macOS'
+        uses: ./.github/actions/test-go-pg
+        with:
+          postgres-version: "13"
+          # Our macOS runners have 8 cores. test-parallelism-tests matches
+          # Linux's rather than the previous 16, to rule out scheduler
+          # contention as a contributor to the macOS test-go-pg timeouts
+          # tracked in coder/internal#1365.
+          test-parallelism-packages: "8"
+          test-parallelism-tests: "8"
+          # Setup and compile take 3 to 10 minutes on macOS, which leaves
+          # too little of the 30 minute job for a goroutine dump when the
+          # default 25 minute Go timeout fires. 15 minutes keeps at least a
+          # 5 minute margin for the dump and artifact uploads even after a
+          # 10 minute setup. A healthy run of these packages takes about 4
+          # minutes.
+          test-timeout: "15m"
+          # By default, run tests with cache for improved speed (possibly at the expense of correctness).
+          # On main, run tests without cache for the inverse.
+          test-count: ${{ github.ref == 'refs/heads/main' && '1' || '' }}
+          # Only the CLI and Agent are officially supported on macOS; the rest are too flaky.
+          test-packages: "./cli/... ./enterprise/cli/... ./agent/..."
+          embedded-pg-path: "/tmp/tmpfs/embedded-pg"
+          embedded-pg-cache: ${{ steps.embedded-pg-cache.outputs.embedded-pg-cache }}
+
+      - name: Test with PostgreSQL Database (Windows)
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/test-go-pg
+        with:
+          postgres-version: "13"
+          # Our Windows runners have 16 cores.
+          # On Windows Postgres chokes up when we have 16x16=256 tests
+          # running in parallel, and dbtestutil.NewDB starts to take more than
+          # 10s to complete sometimes causing test timeouts. With 16x8=128 tests
+          # Postgres tends not to choke.
+          test-parallelism-packages: "8"
+          test-parallelism-tests: "16"
+          # By default, run tests with cache for improved speed (possibly at the expense of correctness).
+          # On main, run tests without cache for the inverse.
+          test-count: ${{ github.ref == 'refs/heads/main' && '1' || '' }}
+          # Only the CLI and Agent are officially supported on Windows; the rest are too flaky.
+          test-packages: "./cli/... ./enterprise/cli/... ./agent/..."
+          embedded-pg-path: "R:/temp/embedded-pg"
+          embedded-pg-cache: ${{ steps.embedded-pg-cache.outputs.embedded-pg-cache }}
+
+      - name: Publish Go test failure report
+        if: failure() && github.actor != 'dependabot[bot]' && runner.os == 'Linux' && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
+        uses: ./.github/actions/go-test-failure-report
+        with:
+          artifact-name: go-test-failures-${{ github.job }}-${{ github.sha }}
+
+      - name: Upload failed test db dumps
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: failed-test-db-dump-${{matrix.os}}
+          path: "**/*.test.sql"
+
+      - name: Upload Test Cache
+        uses: ./.github/actions/test-cache/upload
+        with:
+          cache-key: ${{ steps.download-cache.outputs.cache-key }}
+
+      - name: Upload Embedded Postgres Cache
+        uses: ./.github/actions/embedded-pg-cache/upload
+        # We only use the embedded Postgres cache on macOS and Windows runners.
+        if: runner.OS == 'macOS' || runner.OS == 'Windows'
+        with:
+          cache-key: ${{ steps.download-embedded-pg-cache.outputs.cache-key }}
+          cache-path: "${{ steps.embedded-pg-cache.outputs.embedded-pg-cache }}"
+
+      - name: Upload test stats to Datadog
+        timeout-minutes: 1
+        continue-on-error: true
+        uses: ./.github/actions/upload-datadog
+        if: success() || failure()
+        with:
+          api-key: ${{ secrets.DATADOG_API_KEY }}
+
