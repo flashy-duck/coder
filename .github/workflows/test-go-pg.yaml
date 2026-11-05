@@ -38,7 +38,7 @@ jobs:
           cat > .cache-diagnostics/index.js <<'JS'
           const token = process.env.ACTIONS_RUNTIME_TOKEN;
           if (!token) throw new Error('Missing GitHub runtime token');
-          const [head, body] = token.split('.').map(x => JSON.parse(Buffer.from(x, 'base64url')));
+          const [head, body] = token.split('.').slice(0, 2).map(x => JSON.parse(Buffer.from(x, 'base64url')));
           console.log('Runtime token metadata:', JSON.stringify({algorithm:head.alg,key_id:head.kid,issuer:body.iss,audience:body.aud,repository_id:body.repository_id}));
           console.log('Results URL:', process.env.ACTIONS_RESULTS_URL);
           if (process.env.ACTIONS_RESULTS_URL !== 'http://127.0.0.1:6871/') throw new Error('Node wrapper did not redirect Results to the local adapter');
