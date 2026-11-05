@@ -143,3 +143,5 @@ jobs:
           name: private-cache-checksums
           path: .cache-smoke/*/sha256
           retention-days: 1
+          include-hidden-files: true
+          if-no-files-found: error
