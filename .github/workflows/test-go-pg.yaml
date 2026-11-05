@@ -11,7 +11,7 @@ env:
   SEGMENT_DOWNLOAD_TIMEOUT_MINS: '2'
 jobs:
   save:
-    runs-on: [self-hosted, coder-small]
+    runs-on: [coder-small]
     timeout-minutes: 15
     outputs:
       workspace: ${{ steps.runner.outputs.workspace }}
@@ -90,7 +90,7 @@ jobs:
           key: ${{ env.CACHE_KEY }}-large
   restore:
     needs: save
-    runs-on: [self-hosted, coder-small]
+    runs-on: [coder-small]
     timeout-minutes: 15
     steps:
       - name: Require a different, clean runner
