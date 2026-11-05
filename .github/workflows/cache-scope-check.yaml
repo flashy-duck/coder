@@ -1,0 +1,248 @@
+name: Private cache branch scopes
+run-name: 'Cache scopes: ${{ inputs.phase }} / ${{ inputs.namespace }} / ${{ github.ref_name }}'
+'on':
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Verification phase
+        type: choice
+        options:
+        - seed
+        - feature
+        - verify
+        required: true
+      namespace:
+        description: Unique cache namespace shared by the four runs
+        type: string
+        required: true
+      main-reservation:
+        description: Main seed reservation ID for negative authorization probes
+        type: string
+        required: false
+      broker-url:
+        description: Private cache broker URL reachable from the runner VPC
+        type: string
+        required: false
+permissions: {}
+concurrency:
+  group: cache-scopes-${{ inputs.namespace }}-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  CACHE_NAMESPACE: ${{ inputs.namespace }}
+  PHASE: ${{ inputs.phase }}
+  MAIN_RESERVATION: ${{ inputs.main-reservation }}
+  BROKER_URL: ${{ inputs.broker-url }}
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: '2'
+jobs:
+  scopes:
+    runs-on:
+    - coder-small
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+    - name: Check isolated runner and prepare diagnostics
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "Scope check workspace: $CODER_RUNNER_WORKSPACE_ID"
+        systemctl is-active coder-cache-adapter.service
+        test -z "${AWS_ACCESS_KEY_ID:-}${AWS_SECRET_ACCESS_KEY:-}${AWS_SESSION_TOKEN:-}"
+        test ! -e .cache-scope
+        mkdir -p .cache-diagnostics
+        cat > .cache-diagnostics/action.yml <<'ACTION'
+        name: Verify signed cache scopes
+        description: Check branch grants and reject attempts to escalate them
+        runs:
+          using: node24
+          main: index.js
+        ACTION
+        cat > .cache-diagnostics/index.js <<'JS'
+        const assert = require('node:assert/strict');
+        async function main() {
+          const token = process.env.ACTIONS_RUNTIME_TOKEN;
+          assert(token, 'missing runtime token');
+          const pieces = token.split('.');
+          const body = JSON.parse(Buffer.from(pieces[1], 'base64url'));
+          const grants = JSON.parse(body.ac);
+          console.log('Signed cache grants:', JSON.stringify(grants));
+          console.log('Results URL:', process.env.ACTIONS_RESULTS_URL);
+          assert.equal(process.env.ACTIONS_RESULTS_URL, 'http://127.0.0.1:6871/');
+          const current = process.env.GITHUB_REF;
+          assert(grants.some(g => g.Scope === current && (g.Permission & 2)), 'current ref must be writable');
+          assert(grants.some(g => g.Scope === 'refs/heads/main' && (g.Permission & 1)), 'main must be readable');
+          if (current !== 'refs/heads/main') {
+            assert(!grants.some(g => g.Scope === 'refs/heads/main' && (g.Permission & 2)), 'non-main job must not have main write permission');
+          }
+          if (process.env.PHASE === 'seed') assert.equal(current, 'refs/heads/main');
+          if (process.env.PHASE !== 'feature') return;
+          assert.notEqual(current, 'refs/heads/main');
+          const broker = process.env.BROKER_URL;
+          async function post(path, value, credential = token) {
+            return fetch(broker + path, {method:'POST', redirect:'error', headers:{Authorization:'Bearer '+credential, 'Content-Type':'application/json'}, body:JSON.stringify(value)});
+          }
+          const id = process.env.MAIN_RESERVATION;
+          assert.match(id, /^[0-9a-f-]{36}$/);
+          for (const [suffix, payload] of [['parts', {part_number:1,size:1}], ['complete',{parts:[{part_number:1,etag:'forged'}],size:1}]]) {
+            const response = await post('/v1/reservations/'+id+'/'+suffix, payload);
+            assert.equal(response.status, 403, 'feature cannot use main reservation '+suffix);
+            console.log('Cross-scope reservation '+suffix+' rejected: 403');
+          }
+          const forgedBody = {...body, ac:JSON.stringify([{Scope:'refs/heads/main',Permission:3}])};
+          pieces[1] = Buffer.from(JSON.stringify(forgedBody)).toString('base64url');
+          const rejected = await post('/v1/lookup', {key:process.env.CACHE_NAMESPACE+'-shared',version:'probe'}, pieces.join('.'));
+          assert.equal(rejected.status, 401, 'unsigned grant escalation must be rejected');
+          console.log('Tampered signed grants rejected: 401');
+          const response = await post('/v1/reservations', {key:process.env.CACHE_NAMESPACE+'-forged-scope',version:'probe',scope:'refs/heads/main',repository:'999',data_key:'coder-cache/data/forged'});
+          assert.equal(response.status, 200);
+          const reservation = await response.json();
+          console.log('Client-supplied scope probe reservation:', reservation.id);
+        }
+        main().catch(() => { console.error('Cache scope security assertion failed'); process.exitCode=1; });
+        JS
+    - name: Verify signed branch grants and denied escalation
+      uses: ./.cache-diagnostics
+    - name: Restore shared key from main
+      uses: actions/cache/restore@v5
+      with:
+        path: .cache-scope/data
+        key: ${{ env.CACHE_NAMESPACE }}-shared
+        fail-on-cache-miss: false
+      id: shared
+      if: inputs.phase != 'seed'
+    - name: Verify main cache fallback
+      shell: bash
+      run: |
+        set -euo pipefail
+        test "$CACHE_HIT" = true
+        test "$(cat .cache-scope/data/marker)" = main
+        echo 'Main cache restored with exact key and original contents.'
+      if: inputs.phase != 'seed'
+      env:
+        CACHE_HIT: ${{ steps.shared.outputs.cache-hit }}
+    - name: Prepare branch cache contents
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p .cache-scope/data
+        if [ "$PHASE" = seed ]; then printf main > .cache-scope/data/marker; else printf feature > .cache-scope/data/marker; fi
+      if: inputs.phase != 'verify'
+    - name: Save identical key in current branch
+      uses: actions/cache/save@v5
+      with:
+        path: .cache-scope/data
+        key: ${{ env.CACHE_NAMESPACE }}-shared
+      if: inputs.phase != 'verify'
+    - name: Seed default branch primary key
+      uses: actions/cache/save@v5
+      with:
+        path: .cache-scope/data
+        key: ${{ env.CACHE_NAMESPACE }}-primary
+      if: inputs.phase == 'seed'
+    - name: Save feature-only key
+      uses: actions/cache/save@v5
+      with:
+        path: .cache-scope/data
+        key: ${{ env.CACHE_NAMESPACE }}-feature-only
+      if: inputs.phase == 'feature'
+    - name: Save feature restore-key fallback
+      uses: actions/cache/save@v5
+      with:
+        path: .cache-scope/data
+        key: ${{ env.CACHE_NAMESPACE }}-fallback
+      if: inputs.phase == 'feature'
+    - name: Remove local files before restoring feature cache
+      shell: bash
+      run: |
+        set -euo pipefail
+        rm -rf .cache-scope
+      if: inputs.phase == 'feature'
+    - name: Restore own same-key cache
+      uses: actions/cache/restore@v5
+      with:
+        path: .cache-scope/data
+        key: ${{ env.CACHE_NAMESPACE }}-shared
+        fail-on-cache-miss: false
+      id: own
+      if: inputs.phase == 'feature'
+    - name: Verify feature cache shadows main
+      shell: bash
+      run: |
+        set -euo pipefail
+        test "$CACHE_HIT" = true
+        test "$(cat .cache-scope/data/marker)" = feature
+        echo 'Feature same-key save is isolated and takes precedence over main.'
+        rm -rf .cache-scope
+      if: inputs.phase == 'feature'
+      env:
+        CACHE_HIT: ${{ steps.own.outputs.cache-hit }}
+    - name: Prefer current branch restore key over main exact primary key
+      uses: actions/cache/restore@v5
+      with:
+        path: .cache-scope/data
+        key: ${{ env.CACHE_NAMESPACE }}-primary
+        fail-on-cache-miss: false
+        restore-keys: ${{ env.CACHE_NAMESPACE }}-fallback
+      id: fallback
+      if: inputs.phase == 'feature'
+    - name: Verify branch priority before default branch
+      shell: bash
+      run: |
+        set -euo pipefail
+        test "$CACHE_HIT" = false
+        test "$MATCHED" = "$CACHE_NAMESPACE-fallback"
+        test "$(cat .cache-scope/data/marker)" = feature
+        echo 'Current branch restore-key match takes precedence over main exact match.'
+        rm -rf .cache-scope
+      if: inputs.phase == 'feature'
+      env:
+        CACHE_HIT: ${{ steps.fallback.outputs.cache-hit }}
+        MATCHED: ${{ steps.fallback.outputs.cache-matched-key }}
+    - name: Cache version differs when the path changes
+      uses: actions/cache/restore@v5
+      with:
+        path: .cache-scope/different-path
+        key: ${{ env.CACHE_NAMESPACE }}-shared
+        fail-on-cache-miss: false
+      id: version
+      if: inputs.phase == 'feature'
+    - name: Verify cache version isolation
+      shell: bash
+      run: |
+        set -euo pipefail
+        test "$CACHE_HIT" != true
+        test ! -e .cache-scope
+        echo 'Cache version mismatch correctly missed.'
+      if: inputs.phase == 'feature'
+      env:
+        CACHE_HIT: ${{ steps.version.outputs.cache-hit }}
+    - name: Remove local files before testing feature-only visibility
+      shell: bash
+      run: |
+        set -euo pipefail
+        rm -rf .cache-scope
+      if: inputs.phase == 'verify'
+    - name: Look for inaccessible feature-only key
+      uses: actions/cache/restore@v5
+      with:
+        path: .cache-scope/data
+        key: ${{ env.CACHE_NAMESPACE }}-feature-only
+        fail-on-cache-miss: false
+      id: hidden
+      if: inputs.phase == 'verify'
+    - name: Verify main and sibling cannot see feature-only cache
+      shell: bash
+      run: |
+        set -euo pipefail
+        test -z "$MATCHED"
+        test ! -e .cache-scope
+        echo 'Feature-only cache is invisible from this ref.'
+      if: inputs.phase == 'verify'
+      env:
+        MATCHED: ${{ steps.hidden.outputs.cache-matched-key }}
+    - name: Record branch-scope verification
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "Cache scope phase $PHASE passed on $GITHUB_REF."
+        echo "Verified $PHASE on $GITHUB_REF using workspace $CODER_RUNNER_WORKSPACE_ID." >> "$GITHUB_STEP_SUMMARY"
